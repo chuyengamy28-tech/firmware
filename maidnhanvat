@@ -1,1 +1,742 @@
-123123
+/****************************************************
+ * TÊN DỰ ÁN: REMOTE SMART ESP32-S3 (CHỈ CHẠY WEB / MILLIS)
+ * TÍNH NĂNG:
+ * - PHIÊN BẢN v8.1: (Theo yêu cầu người dùng)
+ * - ĐÃ BỎ: SinricPro.
+ * - ĐÃ BỎ: Thời gian thật (NTP).
+ * - GIỮ NGUYÊN: Web Server, WiFi Manager, OTA.
+ * - GIỮ NGUYÊN: Trang hẹn giờ 3 Chân (4, 5, 7), 3 Lịch, H:M:S.
+ * - LOGIC HẸN GIỜ: Dựa trên thời gian chạy (millis), lặp lại mỗi 24 giờ.
+ *
+ * - [CẬP NHẬT v8.1]:
+ * - Nút "Khởi động lại" (Web) và (Vật lý) sẽ BẬT TỰ ĐỘNG
+ * và KHỞI ĐỘNG LẠI ESP32 để reset chu kỳ 24 giờ.
+ *
+ * KIẾN TRÚC LÕI:
+ * - Lõi 1 (Core 1): Chỉ chạy Web Server.
+ * - Lõi 0 (Core 0): Chạy Task logic tự động (autoControl) 1 giây/lần.
+ ****************************************************/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <HTTPClient.h>
+#include <Update.h>
+#include <Preferences.h>
+#include <WiFiClientSecure.h>
+
+Preferences prefs;
+
+// === BIẾN QUẢN LÝ CHO LÕI 0 ===
+TaskHandle_t LogicTaskHandle; 
+// =============================
+
+// ⚙️ WiFi
+const char* ap_ssid = "Remote Smart";
+const char* ap_pass = "12345678";
+String saved_ssid = "";
+String saved_pass = "";
+
+// ⚙️ GPIO
+#define PIN_1 4
+#define PIN_2 5
+#define PIN_3 7
+#define PIN_4 16
+#define PIN_STOP 8
+#define PIN_RESET 9
+#define PIN_OTA 21
+
+// ⚙️ Biến trạng thái
+bool state1, state2, state3, state4;
+bool stopAll = false;
+// unsigned long startTime = 0; // Không còn dùng
+
+// ⚙️ Biến Debounce cho nút vật lý
+unsigned long lastStopButtonTime = 0;
+unsigned long lastResetButtonTime = 0;
+const unsigned long DEBOUNCE_DELAY = 100; // 100ms
+
+// ⚙️ Biến Preferences
+const char* PREF_NAMESPACE = "smart_config";
+const char* KEY_STOP_ALL = "stop_state";
+const char* KEY_WIFI_SSID = "wifi_ssid";
+const char* KEY_WIFI_PASS = "wifi_pass";
+
+// === [MỚI] BIẾN VÀ KEY CHO HẸN GIỜ (H:M:S) ===
+// Biến toàn cục (dạng long, tính bằng TỔNG SỐ GIÂY)
+long p1_s1_start_s, p1_s1_end_s;
+long p1_s2_start_s, p1_s2_end_s;
+long p1_s3_start_s, p1_s3_end_s;
+long p2_s1_start_s, p2_s1_end_s;
+long p2_s2_start_s, p2_s2_end_s;
+long p2_s3_start_s, p2_s3_end_s;
+long p3_s1_start_s, p3_s1_end_s;
+long p3_s2_start_s, p3_s2_end_s;
+long p3_s3_start_s, p3_s3_end_s;
+// ============================================
+
+// ⚙️ Web & DNS
+WebServer server(80);
+DNSServer dns;
+
+// ⚙️ Link OTA
+const char* firmware_url = "https://github.com/chuyengamy28-tech/firmware/raw/main/update.bin";
+
+// ====================== STATE PERSISTENCE ======================
+void saveState() {
+    prefs.begin(PREF_NAMESPACE, false);
+    prefs.putBool(KEY_STOP_ALL, stopAll);
+    prefs.end();
+    Serial.printf("[PREF] Đã lưu stopAll = %s\n", stopAll ? "TRUE" : "FALSE");
+}
+
+void loadState() {
+    prefs.begin(PREF_NAMESPACE, true);
+    stopAll = prefs.getBool(KEY_STOP_ALL, false);
+    prefs.end();
+    Serial.printf("[PREF] Đã tải stopAll = %s\n", stopAll ? "TRUE" : "FALSE");
+}
+
+// === [MỚI] HÀM TẢI LỊCH HẸN GIỜ (v7) ===
+void loadSchedules() {
+    prefs.begin(PREF_NAMESPACE, true); // Mở ở chế độ read-only
+    
+    // Tải 3 lịch Chân 4 (PIN_1)
+    p1_s1_start_s = prefs.getLong("p1s1_on", 0); p1_s1_end_s = prefs.getLong("p1s1_off", 0);
+    p1_s2_start_s = prefs.getLong("p1s2_on", 0); p1_s2_end_s = prefs.getLong("p1s2_off", 0);
+    p1_s3_start_s = prefs.getLong("p1s3_on", 0); p1_s3_end_s = prefs.getLong("p1s3_off", 0);
+    
+    // Tải 3 lịch Chân 5 (PIN_2)
+    p2_s1_start_s = prefs.getLong("p2s1_on", 0); p2_s1_end_s = prefs.getLong("p2s1_off", 0);
+    p2_s2_start_s = prefs.getLong("p2s2_on", 0); p2_s2_end_s = prefs.getLong("p2s2_off", 0);
+    p2_s3_start_s = prefs.getLong("p2s3_on", 0); p2_s3_end_s = prefs.getLong("p2s3_off", 0);
+    
+    // Tải 3 lịch Chân 7 (PIN_3)
+    p3_s1_start_s = prefs.getLong("p3s1_on", 0); p3_s1_end_s = prefs.getLong("p3s1_off", 0);
+    p3_s2_start_s = prefs.getLong("p3s2_on", 0); p3_s2_end_s = prefs.getLong("p3s2_off", 0);
+    p3_s3_start_s = prefs.getLong("p3s3_on", 0); p3_s3_end_s = prefs.getLong("p3s3_off", 0);
+
+    prefs.end();
+    Serial.println("[SCHED] Đã tải lịch hẹn giờ H:M:S từ Preferences.");
+}
+
+// ====================== CÁC TRANG WEB ======================
+
+// === TRANG WEB CÀI ĐẶT HẸN GIỜ ===
+void handleSchedulePage() {
+    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+    html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html += "<title>Cài đặt Hẹn giờ</title><style>";
+    html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;text-align:center;background:#f0f2f5;margin:0;padding:15px;}";
+    html += "h3{color:#333;margin-top:0;} a{text-decoration:none;}";
+    html += "form{max-width:500px;margin:0 auto 15px auto;padding:15px;background:white;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.08);}";
+    html += ".timegrid{display:grid;grid-template-columns:30px 30px 30px;gap:5px;justify-content:center;}";
+    html += ".timegrid input{width:100%;padding:8px 0;text-align:center;border:1px solid #ccc;border-radius:5px;}";
+    html += ".schedgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:center;margin-top:10px;}";
+    html += ".schedgrid label{font-weight:600;font-size:0.9em;margin:0;}";
+    html += ".pin_section h4{color:#1976D2;margin:15px 0 10px 0;border-bottom:1px solid #eee;padding-bottom:5px;}";
+    html += ".sched_item h5{margin:10px 0 5px 0;font-size:0.95em;color:#555;}";
+    html += "button,.btn{width:auto;min-width:120px;padding:0 15px;height:45px;font-size:16px;font-weight:600;margin:5px;border:none;border-radius:10px;color:white;cursor:pointer;transition:transform 0.1s ease;}";
+    html += "button:active,.btn:active{transform:scale(0.95);}";
+    html += "button[type='submit']{background-color:#4CAF50;width:100%;margin-top:15px;}"; // Nút Lưu
+    html += ".home{background-color:#555;display:inline-block;line-height:45px;}"; // Nút Quay về
+    html += ".note{font-size:0.9em;color:#777;margin-top:15px;}";
+    html += "</style></head><body>";
+    html += "<h3>CÀI ĐẶT HẸN GIỜ (CHU KỲ 24 GIỜ)</h3>"; 
+    html += "<p class='note'>Nhập Giờ(0-23), Phút(0-59), Giây(0-59).<br>Đây là thời gian TÍNH TỪ LÚC CẮM ĐIỆN, lặp lại mỗi 24 giờ.</p>";
+
+    // Form
+    html += "<form action='/save_hengio' method='POST'>";
+
+    // Lambda helper (giúp code gọn)
+    auto getHMS = [](long totalSeconds) {
+        int h = totalSeconds / 3600;
+        totalSeconds %= 3600;
+        int m = totalSeconds / 60;
+        int s = totalSeconds % 60;
+        return String(h) + "," + String(m) + "," + String(s);
+    };
+
+    auto addScheduleInputs = [&](String prefix, long start_s, long end_s) {
+        String startHMS = getHMS(start_s);
+        String endHMS = getHMS(end_s);
+        int h_on, m_on, s_on, h_off, m_off, s_off;
+        sscanf(startHMS.c_str(), "%d,%d,%d", &h_on, &m_on, &s_on);
+        sscanf(endHMS.c_str(), "%d,%d,%d", &h_off, &m_off, &s_off);
+
+        html += "<div class='schedgrid'>";
+        html += "<div><label>BẬT (H:M:S)</label><div class='timegrid'>";
+        html += "<input type='number' min='0' max='23' name='" + prefix + "_h_on' value='" + h_on + "'>";
+        html += "<input type='number' min='0' max='59' name='" + prefix + "_m_on' value='" + m_on + "'>";
+        html += "<input type='number' min='0' max='59' name='" + prefix + "_s_on' value='" + s_on + "'>";
+        html += "</div></div>";
+        html += "<div><label>TẮT (H:M:S)</label><div class='timegrid'>";
+        html += "<input type='number' min='0' max='23' name='" + prefix + "_h_off' value='" + h_off + "'>";
+        html += "<input type='number' min='0' max='59' name='" + prefix + "_m_off' value='" + m_off + "'>";
+        html += "<input type='number' min='0' max='59' name='" + prefix + "_s_off' value='" + s_off + "'>";
+        html += "</div></div>";
+        html += "</div>"; // .schedgrid
+    };
+
+    // --- Thêm 3 Chân ---
+    html += "<div class='pin_section'>";
+    html += "<h4>Chân 4 (PIN_1)</h4>";
+    html += "<h5>Lịch 1</h5>"; addScheduleInputs("p1s1", p1_s1_start_s, p1_s1_end_s);
+    html += "<h5>Lịch 2</h5>"; addScheduleInputs("p1s2", p1_s2_start_s, p1_s2_end_s);
+    html += "<h5>Lịch 3</h5>"; addScheduleInputs("p1s3", p1_s3_start_s, p1_s3_end_s);
+    html += "</div>";
+
+    html += "<div class='pin_section'>";
+    html += "<h4>Chân 5 (PIN_2)</h4>";
+    html += "<h5>Lịch 1</h5>"; addScheduleInputs("p2s1", p2_s1_start_s, p2_s1_end_s);
+    html += "<h5>Lịch 2</h5>"; addScheduleInputs("p2s2", p2_s2_start_s, p2_s2_end_s);
+    html += "<h5>Lịch 3</h5>"; addScheduleInputs("p2s3", p2_s3_start_s, p2_s3_end_s);
+    html += "</div>";
+
+    html += "<div class='pin_section'>";
+    html += "<h4>Chân 7 (PIN_3)</h4>";
+    html += "<h5>Lịch 1</h5>"; addScheduleInputs("p3s1", p3_s1_start_s, p3_s1_end_s);
+    html += "<h5>Lịch 2</h5>"; addScheduleInputs("p3s2", p3_s2_start_s, p3_s2_end_s);
+    html += "<h5>Lịch 3</h5>"; addScheduleInputs("p3s3", p3_s3_start_s, p3_s3_end_s);
+    html += "</div>";
+
+    html += "<p class='note' style='color:red;font-weight:bold;'>Chân 16 (PIN_4) chỉ điều khiển bằng tay.</p>";
+
+    html += "<button type='submit'>Lưu Cài Đặt</button>";
+    html += "</form>";
+    html += "<a href='/' class='btn home'>Quay về trang chủ</a>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+}
+
+// === HÀM XỬ LÝ LƯU HẸN GIỜ ===
+void handleSaveSchedule() {
+    Serial.println("[WEB] Đang nhận lịch hẹn giờ H:M:S mới...");
+
+    auto getSecondsFromForm = [&](String prefix, String type) {
+        long h = server.arg(prefix + "_h_" + type).toInt();
+        long m = server.arg(prefix + "_m_" + type).toInt();
+        long s = server.arg(prefix + "_s_" + type).toInt();
+        return (h * 3600) + (m * 60) + s;
+    };
+
+    p1_s1_start_s = getSecondsFromForm("p1s1", "on"); p1_s1_end_s = getSecondsFromForm("p1s1", "off");
+    p1_s2_start_s = getSecondsFromForm("p1s2", "on"); p1_s2_end_s = getSecondsFromForm("p1s2", "off");
+    p1_s3_start_s = getSecondsFromForm("p1s3", "on"); p1_s3_end_s = getSecondsFromForm("p1s3", "off");
+    p2_s1_start_s = getSecondsFromForm("p2s1", "on"); p2_s1_end_s = getSecondsFromForm("p2s1", "off");
+    p2_s2_start_s = getSecondsFromForm("p2s2", "on"); p2_s2_end_s = getSecondsFromForm("p2s2", "off");
+    p2_s3_start_s = getSecondsFromForm("p2s3", "on"); p2_s3_end_s = getSecondsFromForm("p2s3", "off");
+    p3_s1_start_s = getSecondsFromForm("p3s1", "on"); p3_s1_end_s = getSecondsFromForm("p3s1", "off");
+    p3_s2_start_s = getSecondsFromForm("p3s2", "on"); p3_s2_end_s = getSecondsFromForm("p3s2", "off");
+    p3_s3_start_s = getSecondsFromForm("p3s3", "on"); p3_s3_end_s = getSecondsFromForm("p3s3", "off");
+
+    prefs.begin(PREF_NAMESPACE, false); 
+    prefs.putLong("p1s1_on", p1_s1_start_s); prefs.putLong("p1s1_off", p1_s1_end_s);
+    prefs.putLong("p1s2_on", p1_s2_start_s); prefs.putLong("p1s2_off", p1_s2_end_s);
+    prefs.putLong("p1s3_on", p1_s3_start_s); prefs.putLong("p1s3_off", p1_s3_end_s);
+    prefs.putLong("p2s1_on", p2_s1_start_s); prefs.putLong("p2s1_off", p2_s1_end_s);
+    prefs.putLong("p2s2_on", p2_s2_start_s); prefs.putLong("p2s2_off", p2_s2_end_s);
+    prefs.putLong("p2s3_on", p2_s3_start_s); prefs.putLong("p2s3_off", p2_s3_end_s);
+    prefs.putLong("p3s1_on", p3_s1_start_s); prefs.putLong("p3s1_off", p3_s1_end_s);
+    prefs.putLong("p3s2_on", p3_s2_start_s); prefs.putLong("p3s2_off", p3_s2_end_s);
+    prefs.putLong("p3s3_on", p3_s3_start_s); prefs.putLong("p3s3_off", p3_s3_end_s);
+    prefs.end();
+
+    Serial.println("[SCHED] Đã lưu 18 mốc H:M:S vào Preferences.");
+
+    String html = "<html><head><meta charset='utf-8'><title>Đang lưu</title>";
+    html += "<meta http-equiv='refresh' content='2;url=/'></head>"; 
+    html += "<body><p style='font-family:sans-serif;text-align:center;margin-top:30px;font-size:1.2em;'>";
+    html += "✅ Đã lưu hẹn giờ H:M:S!<br>Đang quay về trang chủ...</p></body></html>";
+    server.send(200, "text/html", html);
+}
+
+
+// --- Các trang WiFi (Giữ nguyên) ---
+void handleWifiSettings() {
+    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+    html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html += "<title>Cài đặt WiFi</title><style>";
+    html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;text-align:center;background:#f0f2f5;margin:0;padding:15px;}";
+    html += "h3{color:#333;margin-top:0;}";
+    html += "a{text-decoration:none;}";
+    html += "form{max-width:350px;margin:0 auto;padding:20px;background:white;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.08);}";
+    html += "input[type='text'],input[type='password'],select{width:100%;box-sizing:border-box;padding:12px;margin:10px 0;border:1px solid #ccc;border-radius:8px;font-size:16px;}";
+    html += "button,.btn{width:auto;min-width:120px;padding:0 15px;height:45px;font-size:16px;font-weight:600;margin:5px;border:none;border-radius:10px;color:white;cursor:pointer;transition:transform 0.1s ease;}";
+    html += "button:active,.btn:active{transform:scale(0.95);}";
+    html += "button[type='submit']{background-color:#2196F3;width:100%;}"; // Nút Lưu
+    html += ".scan{background-color:#FF9800;}"; // Nút Quét
+    html += ".home{background-color:#555;display:inline-block;line-height:45px;margin-top:15px;}";
+    html += "</style>";
+    html += "</head><body>";
+    html += "<form action='/savewifi' method='POST'>";
+    html += "<h3>CÀI ĐẶT WIFI</h3>";
+    if (WiFi.status() == WL_CONNECTED) {
+        html += "<p style='color:green;'>Đang kết nối: <strong>" + WiFi.SSID() + "</strong></p>";
+    } else {
+        html += "<p style='color:red;'>Chưa kết nối WiFi</p>";
+    }
+    html += "<input id='ssid' name='ssid' type='text' placeholder='Tên WiFi (SSID)' value='" + saved_ssid + "'>";
+    html += "<input name='pass' type='password' placeholder='Mật khẩu WiFi'>";
+    html += "<button type='submit'>Lưu & Khởi động lại</button>";
+    html += "</form>";
+    html += "<form action='/wifi_scan_results' method='GET' style='margin-top:15px;padding:15px;'>";
+    html += "<h4 style='margin:15px 0 5px 0;'>Không nhớ tên?</h4>";
+    html += "<button class='scan' type='submit'>Quét WiFi để chọn</button>";
+    html += "</form>";
+    html += "<a href='/' class='btn home'>Quay về trang chủ</a>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handleWifiScanResults() {
+    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+    html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html += "<title>Quét WiFi</title><style>";
+    html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;text-align:center;background:#f0f2f5;margin:0;padding:15px;}";
+    html += "h3{color:#333;margin-top:0;}";
+    html += "a{text-decoration:none;}";
+    html += "form{max-width:350px;margin:0 auto;padding:20px;background:white;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.08);}";
+    html += "input[type='text'],input[type='password'],select{width:100%;box-sizing:border-box;padding:12px;margin:10px 0;border:1px solid #ccc;border-radius:8px;font-size:16px;}";
+    html += "button,.btn{width:auto;min-width:120px;padding:0 15px;height:45px;font-size:16px;font-weight:600;margin:5px;border:none;border-radius:10px;color:white;cursor:pointer;transition:transform 0.1s ease;}";
+    html += "button:active,.btn:active{transform:scale(0.95);}";
+    html += ".scan{background-color:#FF9800;}"; // Nút Quét
+    html += ".home{background-color:#555;display:inline-block;line-height:45px;margin-top:15px;}";
+    html += "h4{margin:15px 0 5px 0;}";
+    html += "</style>";
+    html += "<script>";
+    html += "function sel(v){ var el = document.getElementById('selected_ssid_text'); if(el) el.innerHTML = 'Đã chọn: <strong>' + v + '</strong><br>Quay lại trang trước để Lưu.'; }";
+    html += "</script>";
+    html += "</head><body>";
+    html += "<div style='max-width:350px;margin:0 auto;'>";
+    html += "<h3>KẾT QUẢ QUÉT WIFI</h3>";
+    html += "<p>Đang quét... vui lòng chờ.</p>";
+    html += "<form action='/wifi_scan_results' method='GET' style='padding:15px;background:white;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.08);'>";
+    html += "<button class='scan' type='submit'>Quét lại</button>";
+    Serial.println("[WIFI] Tạm ngắt STA để ưu tiên quét...");
+    WiFi.disconnect();
+    delay(100);
+    Serial.println("[WIFI] Bắt đầu quét mạng...");
+    int n = WiFi.scanNetworks();
+    Serial.printf("[WIFI] Quét xong, tìm thấy %d mạng.\n", n);
+    Serial.println("[WIFI] Khởi động lại kết nối STA...");
+    if (saved_ssid.length() > 0) {
+         WiFi.begin(saved_ssid.c_str(), saved_pass.c_str());
+    }
+    if (n > 0) {
+        html += "<h4>Tìm thấy " + String(n) + " mạng:</h4>";
+        html += "<select onchange='sel(this.value)'>";
+        html += "<option value=''>-- Chọn mạng --</option>";
+        for (int i = 0; i < n; ++i) {
+            html += "<option value='" + WiFi.SSID(i) + "'>" + WiFi.SSID(i) + " (" + WiFi.RSSI(i) + "dBm)</option>";
+        }
+        html += "</select>";
+        html += "<p id='selected_ssid_text' style='margin-top:10px;color:green;'></p>";
+    } else {
+        html += "<p>Không tìm thấy mạng WiFi nào.</p>";
+    }
+    html += "</form>";
+    html += "<a href='/wifi' class='btn home'>Quay lại Cài đặt</a>";
+    html += "</div></body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handleSaveWifi() {
+    String ssid = server.arg("ssid");
+    String pass = server.arg("pass");
+    Serial.println("[WIFI] Đang lưu cài đặt WiFi mới...");
+    Serial.println("SSID: " + ssid);
+    prefs.begin(PREF_NAMESPACE, false);
+    prefs.putString(KEY_WIFI_SSID, ssid);
+    prefs.putString(KEY_WIFI_PASS, pass);
+    prefs.end();
+    String html = "<html><head><meta charset='utf-8'><title>Đang lưu</title>";
+    html += "<meta http-equiv='refresh' content='5;url=/'></head>"; // Tự chuyển hướng sau 5s
+    html += "<body><p>Đã lưu WiFi! Đang khởi động lại...</p></body></html>";
+    server.send(200, "text/html", html);
+    delay(2000);
+    ESP.restart();
+}
+
+// --- TRANG CHỦ (Đã sửa bỏ NTP/Sinric) ---
+String htmlPage() {
+    // [MỚI] Hiển thị thời gian chạy (Uptime)
+    unsigned long now_ms = millis();
+    unsigned long cycle_ms = now_ms % (24UL * 3600UL * 1000UL); // Thời gian trong chu kỳ 24h
+    
+    long h = cycle_ms / 3600000;
+    cycle_ms %= 3600000;
+    long m = cycle_ms / 60000;
+    cycle_ms %= 60000;
+    long s = cycle_ms / 1000;
+    
+    char timeStr[50];
+    sprintf(timeStr, "%02ld:%02ld:%02ld (Chu kỳ 24 giờ)", h, m, s);
+
+    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+    html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html += "<title>Remote Smart (Millis)</title>"; // Sửa tiêu đề
+    html += "<style>";
+    html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;text-align:center;background:#f0f2f5;margin:0;padding:15px;}";
+    html += "h3{color:#333;}";
+    html += "a{text-decoration:none;}";
+    html += ".container{max-width:800px;margin:0 auto;}";
+    html += ".status{margin-bottom:20px;padding:15px;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.08);line-height:1.7;text-align:left;}";
+    html += ".status strong{color:#555;}";
+    html += ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:15px;margin-bottom:20px;}";
+    html += ".card{background:#fff;padding:15px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.08);display:flex;flex-direction:column;justify-content:space-between;}";
+    html += ".card h4{margin:0 0 10px 0;color:#333;font-size:1em;}";
+    html += "button,.btn{width:100%;height:45px;font-size:16px;font-weight:600;margin:5px 0 0 0;border:none;border-radius:10px;color:white;cursor:pointer;transition:transform 0.1s ease;}";
+    html += "button:active,.btn:active{transform:scale(0.95);}";
+    html += ".on{background-color:#4CAF50;}";
+    html += ".off{background-color:#f44336;}";
+    html += ".control{background-color:#2196F3;}";
+    html += ".ota{background-color:#FF9800;}"; // Màu cam
+    html += ".wifi{background-color:#555;}"; // Màu xám
+    html += "</style></head><body>";
+
+    html += "<div class='container'>";
+    html += "<h3>HỆ THỐNG ĐIỀU KHIỂN (OFFLINE)</h3>"; // Sửa tiêu đề
+
+    // --- Card Trạng thái ---
+    html += "<div class='status'>";
+    if (WiFi.status() == WL_CONNECTED) {
+        html += "<strong>WIFI: </strong><span style='color:green;'>" + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")</span><br>";
+    } else {
+        html += "<strong>WIFI: </strong><span style='color:red;'>Chưa kết nối (AP: " + WiFi.softAPIP().toString() + ")</span><br>";
+    }
+    html += "<strong>THỜI GIAN CHẠY: </strong>" + String(timeStr) + "<br>";
+    String status_text = stopAll ? "<span style='color:#f44336;'>ĐANG DỪNG</span>" : "<span style='color:#4CAF50;'>ĐANG CHẠY</span>";
+    html += "<strong>TỰ ĐỘNG: </strong>" + status_text + "</div>";
+
+    // --- Lưới các nút ---
+    html += "<div class='grid'>";
+
+    auto addBtnCard = [&](String name, bool state, String url, String cssClass = "") {
+        String cls = cssClass.isEmpty() ? (state ? "on" : "off") : cssClass;
+        String label = (cssClass == "control" || cssClass == "ota" || cssClass == "wifi") ? name : (state ? "ON" : "OFF");
+        html += "<div class='card'>";
+        html += "<h4>" + name + "</h4>";
+        html += "<button class='" + cls + "' onclick=\"location.href='" + url + "'\">" + label + "</button>";
+        html += "</div>";
+    };
+
+    addBtnCard("Ổ cắm 1 (tên máy)", state1, "/toggle1");
+    addBtnCard("Ổ cắm 2 (tên máy)", state2, "/toggle2");
+    addBtnCard("Ổ cắm 3 (tên máy)", state3, "/toggle3");
+    addBtnCard("Ổ cắm 4 (tên máy)", state4, "/toggle4"); 
+
+    addBtnCard(stopAll ? "Bật tự động" : "Dừng tự động", stopAll, "/toggleStop", "control");
+    addBtnCard("Khởi động lại", false, "/resetAuto", "control");
+    addBtnCard("Cài đặt Hẹn giờ", false, "/hengio", "ota"); 
+    addBtnCard("Cài đặt WiFi", false, "/wifi", "wifi"); 
+
+    html += "</div>"; 
+    
+    html += "<div class='grid' style='grid-template-columns:1fr;'>";
+    addBtnCard("Cập nhật FW", false, "/otaUpdate", "ota");
+    html += "</div>";
+    
+    html += "</div>"; 
+    html += "</body></html>";
+    return html;
+}
+
+// ====================== OTA ======================
+void performOTA() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("❌ Không có WiFi để OTA");
+        return;
+    }
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient https;
+    Serial.println("🔗 Kết nối đến GitHub...");
+    if (!https.begin(client, firmware_url)) {
+        Serial.println("❌ Không thể bắt đầu kết nối HTTPS!");
+        return;
+    }
+    int httpCode = https.GET();
+    if (httpCode == HTTP_CODE_FOUND || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+        String newURL = https.getLocation();
+        Serial.println("➡️ Chuyển hướng đến: " + newURL);
+        https.end();
+        if (!https.begin(client, newURL)) return;
+        httpCode = https.GET();
+    }
+    if (httpCode == HTTP_CODE_OK) {
+        int contentLength = https.getSize();
+        WiFiClient *stream = https.getStreamPtr();
+        if (contentLength > 0 && Update.begin(contentLength)) {
+            Serial.printf("📦 Firmware: %d bytes\n", contentLength);
+            size_t written = Update.writeStream(*stream);
+            Serial.printf("📝 Đã ghi: %d bytes\n", written);
+            if (written == contentLength && Update.end(true)) {
+                Serial.println("✅ Cập nhật thành công! Khởi động lại...");
+                delay(1000);
+                ESP.restart();
+            }
+        } else {
+            Serial.println("❌ Cập nhật thất bại hoặc file quá lớn!");
+        }
+    } else {
+        Serial.printf("❌ Lỗi tải Firmware, HTTP code: %d\n", httpCode);
+    }
+    https.end();
+}
+
+
+// === [MỚI] HÀM AUTOCONTROL (v8 - Dùng Millis 24h) ===
+void autoControl() {
+    if (stopAll) return;
+
+    const unsigned long CYCLE_SECONDS = 24UL * 3600UL; // 86400 giây
+    unsigned long currentTimeInSeconds = (millis() / 1000) % CYCLE_SECONDS;
+
+    auto getTargetState = [&](long startSec, long endSec) {
+        if (startSec == endSec) return false; 
+        
+        if (startSec < endSec) {
+            return (currentTimeInSeconds >= startSec) && (currentTimeInSeconds < endSec);
+        } else {
+            return (currentTimeInSeconds >= startSec) || (currentTimeInSeconds < endSec);
+        }
+    };
+
+    // --- Lịch tự động cho Chân 4 (PIN_1) ---
+    bool targetState1 = getTargetState(p1_s1_start_s, p1_s1_end_s) ||
+                        getTargetState(p1_s2_start_s, p1_s2_end_s) ||
+                        getTargetState(p1_s3_start_s, p1_s3_end_s);
+                        
+    if (targetState1 != state1) {
+        state1 = targetState1;
+        digitalWrite(PIN_1, state1);
+        Serial.printf("[AUTO] Chân 4: %s\n", state1 ? "BẬT" : "TẮT");
+    }
+
+    // --- Lịch tự động cho Chân 5 (PIN_2) ---
+    bool targetState2 = getTargetState(p2_s1_start_s, p2_s1_end_s) ||
+                        getTargetState(p2_s2_start_s, p2_s2_end_s) ||
+                        getTargetState(p2_s3_start_s, p2_s3_end_s);
+
+    if (targetState2 != state2) {
+        state2 = targetState2;
+        digitalWrite(PIN_2, state2);
+        Serial.printf("[AUTO] Chân 5: %s\n", state2 ? "BẬT" : "TẮT");
+    }
+
+    // --- Lịch tự động cho Chân 7 (PIN_3) ---
+    bool targetState3 = getTargetState(p3_s1_start_s, p3_s1_end_s) ||
+                        getTargetState(p3_s2_start_s, p3_s2_end_s) ||
+                        getTargetState(p3_s3_start_s, p3_s3_end_s);
+
+    if (targetState3 != state3) {
+        state3 = targetState3;
+        digitalWrite(PIN_3, state3);
+        Serial.printf("[AUTO] Chân 7: %s\n", state3 ? "BẬT" : "TẮT");
+    }
+}
+
+
+// === TÁC VỤ LÕI 0 (ĐÃ SỬA, CHỈ CHẠY LOGIC) ===
+void logicTask(void *pvParameters) {
+    Serial.println("[TASK] Tác vụ Logic (Millis) đã khởi động trên Lõi 0.");
+
+    unsigned long lastAutoControl = 0;
+
+    for (;;) { 
+        // Chạy autoControl 1 giây 1 lần
+        if (millis() - lastAutoControl >= 1000) {
+            autoControl(); // Gọi hàm autoControl (v8) mới
+            lastAutoControl = millis();
+        }
+        
+        // Nghỉ 100ms
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
+// ===================================
+
+
+// ====================== SETUP ======================
+void setup() {
+    Serial.begin(115200);
+
+    loadState(); // Tải trạng thái Dừng/Chạy
+    loadSchedules(); // [MỚI] Tải lịch hẹn giờ H:M:S đã lưu
+
+    prefs.begin(PREF_NAMESPACE, true);
+    saved_ssid = prefs.getString(KEY_WIFI_SSID, "");
+    saved_pass = prefs.getString(KEY_WIFI_PASS, "");
+    prefs.end();
+
+    pinMode(PIN_1, OUTPUT); digitalWrite(PIN_1, LOW);
+    pinMode(PIN_2, OUTPUT); digitalWrite(PIN_2, LOW);
+    pinMode(PIN_3, OUTPUT); digitalWrite(PIN_3, LOW);
+    pinMode(PIN_4, OUTPUT); digitalWrite(PIN_4, LOW);
+    pinMode(PIN_STOP, INPUT_PULLUP);
+    pinMode(PIN_RESET, INPUT_PULLUP);
+    pinMode(PIN_OTA, INPUT_PULLUP);
+
+    state1 = state2 = state3 = state4 = LOW;
+
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(ap_ssid, ap_pass);
+    delay(100);
+    dns.start(53, "*", WiFi.softAPIP());
+    Serial.println("✅ AP đã khởi động: " + String(ap_ssid));
+    Serial.print("IP AP: "); Serial.println(WiFi.softAPIP());
+
+    if (saved_ssid.length() > 0) {
+        Serial.printf("📡 Đang kết nối đến WiFi đã lưu: %s\n", saved_ssid.c_str());
+        WiFi.begin(saved_ssid.c_str(), saved_pass.c_str());
+        unsigned long t = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
+            delay(500);
+            Serial.print(".");
+        }
+        Serial.println();
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("✅ Kết nối WiFi thành công!");
+            Serial.print("IP LAN: "); Serial.println(WiFi.localIP());
+        } else {
+            Serial.println("❌ Kết nối WiFi thất bại! Chỉ chạy AP.");
+        }
+    } else {
+        Serial.println("ℹ️ Chưa có WiFi nào được lưu. Chỉ chạy AP.");
+    }
+
+    // Khai báo Web Server Handlers (CHẠY TRÊN LÕI 1)
+    server.on("/", [](){ server.send(200, "text/html", htmlPage()); });
+
+    server.on("/hengio", HTTP_GET, handleSchedulePage);
+    server.on("/save_hengio", HTTP_POST, handleSaveSchedule);
+
+    // Toggle 1
+    server.on("/toggle1", [](){
+        if (stopAll) { 
+            state1 = !state1; digitalWrite(PIN_1, state1);
+        }
+        server.sendHeader("Location", "/"); server.send(303);
+    });
+    // Toggle 2
+    server.on("/toggle2", [](){
+        if (stopAll) {
+            state2 = !state2; digitalWrite(PIN_2, state2);
+        }
+        server.sendHeader("Location", "/"); server.send(303);
+    });
+    // Toggle 3
+    server.on("/toggle3", [](){
+        if (stopAll) {
+            state3 = !state3; digitalWrite(PIN_3, state3);
+        }
+        server.sendHeader("Location", "/"); server.send(303);
+    });
+    
+    // Toggle 4 (Chân 16)
+    server.on("/toggle4", [](){
+        if (stopAll) {
+            state4 = !state4;
+            digitalWrite(PIN_4, state4);
+            Serial.printf("[WEB] Chân 16 (PIN_4) đã chuyển sang: %s\n", state4 ? "ON" : "OFF");
+        } else {
+            Serial.println("[WEB] Chân 16 bị chặn do Auto Control đang chạy!");
+        }
+        server.sendHeader("Location", "/"); server.send(303);
+    });
+
+    // Các nút control
+    server.on("/toggleStop", [](){
+        stopAll = !stopAll;
+        saveState();
+        server.sendHeader("Location", "/"); server.send(303);
+    });
+    
+    // === [SỬA v8.1] NÚT RESET WEB ===
+    // Nút Khởi động lại (Reset) từ Web -> Sẽ BẬT AUTO và khởi động lại ESP
+    server.on("/resetAuto", [](){
+        Serial.println("[WEB] Nhan nut KHOI DONG LAI! Bat Auto va restart...");
+        stopAll = false; // Đảm bảo Auto được BẬT
+        saveState();     // Lưu trạng thái BẬT
+        server.send(200, "text/html", "<p style='font-family:sans-serif;font-size:1.2em;text-align:center;'>Da bat Auto.<br>Dang khoi dong lai...</p>");
+        delay(1000);
+        ESP.restart(); // Khởi động lại chip
+    });
+    
+    server.on("/otaUpdate", [](){ server.send(200, "text/html", "<h3>Đang cập nhật firmware...</h3>"); performOTA(); });
+
+    // Các handler WiFi
+    server.on("/wifi", HTTP_GET, handleWifiSettings); 
+    server.on("/wifi_scan_results", HTTP_GET, handleWifiScanResults); 
+    server.on("/savewifi", HTTP_POST, handleSaveWifi); 
+
+    // Captive Portal
+    server.onNotFound([]() {
+        if (WiFi.status() != WL_CONNECTED && saved_ssid.length() == 0) {
+             server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/wifi", true);
+             server.send(302, "text/plain", "");
+        } else {
+             server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/", true);
+             server.send(302, "text/plain", "");
+        }
+    });
+
+    server.begin();
+
+    Serial.println("✅ ESP32-S3 (v8.1 - Millis) đã khởi động hoàn tất! Web Server đang chạy trên Lõi 1.");
+
+    // === KHỞI ĐỘNG TÁC VỤ LÕI 0 ===
+    xTaskCreatePinnedToCore(
+        logicTask,          /* Hàm để chạy Task */
+        "LogicTask",        /* Tên của Task (để debug) */
+        4096,               /* Kích thước Stack (giảm) */
+        NULL,               /* Tham số đầu vào cho Task */
+        1,                  /* Ưu tiên (priority) */
+        &LogicTaskHandle,   /* Handle của Task */
+        0                   /* Ghim vào Lõi 0 (Core 0) */
+    );
+}
+
+// ====================== LOOP (LÕI 1 - SIÊU NHANH) ======================
+// === [SỬA v8.1] LOGIC NÚT NHẤN ===
+void loop() {
+    dns.processNextRequest();
+    server.handleClient();
+
+    unsigned long now = millis();
+    
+    // Nút DỪNG Auto (PIN_STOP - GPIO 8)
+    if (digitalRead(PIN_STOP) == LOW) {
+        if (now - lastStopButtonTime > DEBOUNCE_DELAY) {
+            if (!stopAll) { // Chỉ kích hoạt 1 lần
+                stopAll = true;
+                saveState(); // Lưu trạng thái DỪNG ngay lập tức
+                Serial.println("[BUTTON] Auto Control DỪNG (PIN_STOP)");
+            }
+        }
+        lastStopButtonTime = now;
+    }
+
+    // Nút KHỞI ĐỘNG LẠI ESP (PIN_RESET - GPIO 9)
+    // Sẽ BẬT AUTO và khởi động lại chip
+    if (digitalRead(PIN_RESET) == LOW) {
+        if (now - lastResetButtonTime > DEBOUNCE_DELAY) {
+            Serial.println("[BUTTON] Nhan nut KHOI DONG LAI! Bat Auto va restart...");
+            stopAll = false; // Đảm bảo Auto được BẬT
+            saveState();     // Lưu trạng thái BẬT
+            delay(500);      // Chờ Serial in ra
+            ESP.restart();   // Khởi động lại chip
+        }
+        lastResetButtonTime = now;
+    }
+
+    // Nút OTA
+    if (digitalRead(PIN_OTA) == LOW) {
+      if (WiFi.status() == WL_CONNECTED) {
+        performOTA(); 
+      } else {
+        Serial.println("Nhấn OTA nhưng không có WiFi!");
+      }
+    }
+}
