@@ -1,20 +1,18 @@
 /****************************************************
- * TÊN DỰ ÁN: REMOTE SMART ESP32-S3 (CHỈ CHẠY WEB / MILLIS)
+ * TÊN DỰ ÁN: REMOTE SMART ESP32-S3 (CÓ OTA + SINRIC PRO + NTP)
  * TÍNH NĂNG:
- * - PHIÊN BẢN v8.1: (Theo yêu cầu người dùng)
- * - ĐÃ BỎ: SinricPro.
- * - ĐÃ BỎ: Thời gian thật (NTP).
- * - GIỮ NGUYÊN: Web Server, WiFi Manager, OTA.
- * - GIỮ NGUYÊN: Trang hẹn giờ 3 Chân (4, 5, 7), 3 Lịch, H:M:S.
- * - LOGIC HẸN GIỜ: Dựa trên thời gian chạy (millis), lặp lại mỗi 24 giờ.
- *
- * - [CẬP NHẬT v8.1]:
- * - Nút "Khởi động lại" (Web) và (Vật lý) sẽ BẬT TỰ ĐỘNG
- * và KHỞI ĐỘNG LẠI ESP32 để reset chu kỳ 24 giờ.
+ * - PHIÊN BẢN v7: (Theo yêu cầu người dùng)
+ * - Hẹn giờ Web cho 3 CHÂN (4, 5, 7).
+ * - Mỗi chân có 3 LỊCH HẸN GIỜ độc lập.
+ * - Độ chính xác tới GIỜ:PHÚT:GIÂY (H:M:S).
+ * - Chân 16 (PIN_4) chỉ điều khiển bằng tay.
+ * - Lịch hẹn giờ được LƯU vào Preferences (dưới dạng tổng số giây).
+ * - Tự động xử lý lịch "trong ngày" và "qua đêm".
  *
  * KIẾN TRÚC LÕI:
  * - Lõi 1 (Core 1): Chỉ chạy Web Server.
- * - Lõi 0 (Core 0): Chạy Task logic tự động (autoControl) 1 giây/lần.
+ * - Lõi 0 (Core 0): Chạy Task quản lý Internet (Sinric, NTP) và
+ * Task logic tự động (đọc lịch hẹn giờ đã lưu).
  ****************************************************/
 
 #include <WiFi.h>
@@ -24,11 +22,16 @@
 #include <Update.h>
 #include <Preferences.h>
 #include <WiFiClientSecure.h>
+#include <SinricPro.h>
+#include <SinricProSwitch.h>
+#include <time.h> // Thêm thư viện NTP
 
 Preferences prefs;
 
 // === BIẾN QUẢN LÝ CHO LÕI 0 ===
-TaskHandle_t LogicTaskHandle; 
+TaskHandle_t NetworkTaskHandle; 
+bool isInternetActive = false; 
+bool sinricStarted = false; 
 // =============================
 
 // ⚙️ WiFi
@@ -36,6 +39,13 @@ const char* ap_ssid = "Remote Smart";
 const char* ap_pass = "12345678";
 String saved_ssid = "";
 String saved_pass = "";
+
+// ⚙️ Sinric Pro (chỉ 3 thiết bị)
+#define APP_KEY       "90c7281e-d20e-4991-9e16-e69dbcd53548"
+#define APP_SECRET    "0209ebce-d065-46ff-8d0f-4b975fc8f189-822cdecd-d3a7-4f79-a4d5-919214ece972"
+#define SWITCH_ID_1 "68ff3757ba649e246c134f80"
+#define SWITCH_ID_2 "68ff55d7ba649e246c135b09"
+#define SWITCH_ID_3 "68ff560facd5d3d66b56ba0a"
 
 // ⚙️ GPIO
 #define PIN_1 4
@@ -49,7 +59,15 @@ String saved_pass = "";
 // ⚙️ Biến trạng thái
 bool state1, state2, state3, state4;
 bool stopAll = false;
-// unsigned long startTime = 0; // Không còn dùng
+unsigned long startTime = 0;
+
+// Biến cho NTP
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 7 * 3600; // UTC+7
+const int daylightOffset_sec = 0;
+
+// Biến cho logic 2s/2s (của Chân 4)
+// (LOGIC NÀY ĐÃ BỊ XÓA THEO YÊU CẦU MỚI, THAY BẰNG LỊCH H:M:S)
 
 // ⚙️ Biến Debounce cho nút vật lý
 unsigned long lastStopButtonTime = 0;
@@ -64,12 +82,15 @@ const char* KEY_WIFI_PASS = "wifi_pass";
 
 // === [MỚI] BIẾN VÀ KEY CHO HẸN GIỜ (H:M:S) ===
 // Biến toàn cục (dạng long, tính bằng TỔNG SỐ GIÂY)
+// 3 Lịch cho Chân 4 (PIN_1)
 long p1_s1_start_s, p1_s1_end_s;
 long p1_s2_start_s, p1_s2_end_s;
 long p1_s3_start_s, p1_s3_end_s;
+// 3 Lịch cho Chân 5 (PIN_2)
 long p2_s1_start_s, p2_s1_end_s;
 long p2_s2_start_s, p2_s2_end_s;
 long p2_s3_start_s, p2_s3_end_s;
+// 3 Lịch cho Chân 7 (PIN_3)
 long p3_s1_start_s, p3_s1_end_s;
 long p3_s2_start_s, p3_s2_end_s;
 long p3_s3_start_s, p3_s3_end_s;
@@ -120,9 +141,15 @@ void loadSchedules() {
     Serial.println("[SCHED] Đã tải lịch hẹn giờ H:M:S từ Preferences.");
 }
 
+// ====================== NTP Setup ======================
+void initTime() {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    Serial.println("[NTP] Đã cấu hình NTP (UTC+7)");
+}
+
 // ====================== CÁC TRANG WEB ======================
 
-// === TRANG WEB CÀI ĐẶT HẸN GIỜ ===
+// === [MỚI] TRANG WEB CÀI ĐẶT HẸN GIỜ (v7 - H:M:S) ===
 void handleSchedulePage() {
     String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
     html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
@@ -142,13 +169,14 @@ void handleSchedulePage() {
     html += ".home{background-color:#555;display:inline-block;line-height:45px;}"; // Nút Quay về
     html += ".note{font-size:0.9em;color:#777;margin-top:15px;}";
     html += "</style></head><body>";
-    html += "<h3>CÀI ĐẶT HẸN GIỜ (CHU KỲ 24 GIỜ)</h3>"; 
-    html += "<p class='note'>Nhập Giờ(0-23), Phút(0-59), Giây(0-59).<br>Đây là thời gian TÍNH TỪ LÚC CẮM ĐIỆN, lặp lại mỗi 24 giờ.</p>";
+    html += "<h3>CÀI ĐẶT HẸN GIỜ (H:M:S)</h3>";
+    html += "<p class='note'>Nhập Giờ(0-23), Phút(0-59), Giây(0-59).<br>Để Bật = Tắt (ví dụ 0:0:0) để vô hiệu hóa lịch đó.</p>";
 
     // Form
     html += "<form action='/save_hengio' method='POST'>";
 
-    // Lambda helper (giúp code gọn)
+    // === Lambda helper (giúp code gọn) ===
+    // 1. Tách số giây tổng thành H, M, S
     auto getHMS = [](long totalSeconds) {
         int h = totalSeconds / 3600;
         totalSeconds %= 3600;
@@ -157,6 +185,7 @@ void handleSchedulePage() {
         return String(h) + "," + String(m) + "," + String(s);
     };
 
+    // 2. Vẽ 1 lịch (6 ô nhập liệu)
     auto addScheduleInputs = [&](String prefix, long start_s, long end_s) {
         String startHMS = getHMS(start_s);
         String endHMS = getHMS(end_s);
@@ -165,11 +194,13 @@ void handleSchedulePage() {
         sscanf(endHMS.c_str(), "%d,%d,%d", &h_off, &m_off, &s_off);
 
         html += "<div class='schedgrid'>";
+        // Cột BẬT
         html += "<div><label>BẬT (H:M:S)</label><div class='timegrid'>";
         html += "<input type='number' min='0' max='23' name='" + prefix + "_h_on' value='" + h_on + "'>";
         html += "<input type='number' min='0' max='59' name='" + prefix + "_m_on' value='" + m_on + "'>";
         html += "<input type='number' min='0' max='59' name='" + prefix + "_s_on' value='" + s_on + "'>";
         html += "</div></div>";
+        // Cột TẮT
         html += "<div><label>TẮT (H:M:S)</label><div class='timegrid'>";
         html += "<input type='number' min='0' max='23' name='" + prefix + "_h_off' value='" + h_off + "'>";
         html += "<input type='number' min='0' max='59' name='" + prefix + "_m_off' value='" + m_off + "'>";
@@ -180,21 +211,21 @@ void handleSchedulePage() {
 
     // --- Thêm 3 Chân ---
     html += "<div class='pin_section'>";
-    html += "<h4>Chân 4 (PIN_1)</h4>";
+    html += "<h4>Ổ cắm 1 (tên máy)</h4>";
     html += "<h5>Lịch 1</h5>"; addScheduleInputs("p1s1", p1_s1_start_s, p1_s1_end_s);
     html += "<h5>Lịch 2</h5>"; addScheduleInputs("p1s2", p1_s2_start_s, p1_s2_end_s);
     html += "<h5>Lịch 3</h5>"; addScheduleInputs("p1s3", p1_s3_start_s, p1_s3_end_s);
     html += "</div>";
 
     html += "<div class='pin_section'>";
-    html += "<h4>Chân 5 (PIN_2)</h4>";
+    html += "<h4>Ổ cắm 2 (tên máy)</h4>";
     html += "<h5>Lịch 1</h5>"; addScheduleInputs("p2s1", p2_s1_start_s, p2_s1_end_s);
     html += "<h5>Lịch 2</h5>"; addScheduleInputs("p2s2", p2_s2_start_s, p2_s2_end_s);
     html += "<h5>Lịch 3</h5>"; addScheduleInputs("p2s3", p2_s3_start_s, p2_s3_end_s);
     html += "</div>";
 
     html += "<div class='pin_section'>";
-    html += "<h4>Chân 7 (PIN_3)</h4>";
+    html += "<h4>Ổ cắm 3 (tên máy)</h4>";
     html += "<h5>Lịch 1</h5>"; addScheduleInputs("p3s1", p3_s1_start_s, p3_s1_end_s);
     html += "<h5>Lịch 2</h5>"; addScheduleInputs("p3s2", p3_s2_start_s, p3_s2_end_s);
     html += "<h5>Lịch 3</h5>"; addScheduleInputs("p3s3", p3_s3_start_s, p3_s3_end_s);
@@ -209,10 +240,11 @@ void handleSchedulePage() {
     server.send(200, "text/html", html);
 }
 
-// === HÀM XỬ LÝ LƯU HẸN GIỜ ===
+// === [MỚI] HÀM XỬ LÝ LƯU HẸN GIỜ (v7 - H:M:S) ===
 void handleSaveSchedule() {
     Serial.println("[WEB] Đang nhận lịch hẹn giờ H:M:S mới...");
 
+    // Lambda helper: Lấy H, M, S từ form và trả về TỔNG SỐ GIÂY
     auto getSecondsFromForm = [&](String prefix, String type) {
         long h = server.arg(prefix + "_h_" + type).toInt();
         long m = server.arg(prefix + "_m_" + type).toInt();
@@ -220,23 +252,29 @@ void handleSaveSchedule() {
         return (h * 3600) + (m * 60) + s;
     };
 
+    // 1. Đọc và chuyển đổi
     p1_s1_start_s = getSecondsFromForm("p1s1", "on"); p1_s1_end_s = getSecondsFromForm("p1s1", "off");
     p1_s2_start_s = getSecondsFromForm("p1s2", "on"); p1_s2_end_s = getSecondsFromForm("p1s2", "off");
     p1_s3_start_s = getSecondsFromForm("p1s3", "on"); p1_s3_end_s = getSecondsFromForm("p1s3", "off");
+    
     p2_s1_start_s = getSecondsFromForm("p2s1", "on"); p2_s1_end_s = getSecondsFromForm("p2s1", "off");
     p2_s2_start_s = getSecondsFromForm("p2s2", "on"); p2_s2_end_s = getSecondsFromForm("p2s2", "off");
     p2_s3_start_s = getSecondsFromForm("p2s3", "on"); p2_s3_end_s = getSecondsFromForm("p2s3", "off");
+    
     p3_s1_start_s = getSecondsFromForm("p3s1", "on"); p3_s1_end_s = getSecondsFromForm("p3s1", "off");
     p3_s2_start_s = getSecondsFromForm("p3s2", "on"); p3_s2_end_s = getSecondsFromForm("p3s2", "off");
     p3_s3_start_s = getSecondsFromForm("p3s3", "on"); p3_s3_end_s = getSecondsFromForm("p3s3", "off");
 
-    prefs.begin(PREF_NAMESPACE, false); 
+    // 2. Lưu vào Preferences
+    prefs.begin(PREF_NAMESPACE, false); // Mở chế độ read-write
     prefs.putLong("p1s1_on", p1_s1_start_s); prefs.putLong("p1s1_off", p1_s1_end_s);
     prefs.putLong("p1s2_on", p1_s2_start_s); prefs.putLong("p1s2_off", p1_s2_end_s);
     prefs.putLong("p1s3_on", p1_s3_start_s); prefs.putLong("p1s3_off", p1_s3_end_s);
+    
     prefs.putLong("p2s1_on", p2_s1_start_s); prefs.putLong("p2s1_off", p2_s1_end_s);
     prefs.putLong("p2s2_on", p2_s2_start_s); prefs.putLong("p2s2_off", p2_s2_end_s);
     prefs.putLong("p2s3_on", p2_s3_start_s); prefs.putLong("p2s3_off", p2_s3_end_s);
+    
     prefs.putLong("p3s1_on", p3_s1_start_s); prefs.putLong("p3s1_off", p3_s1_end_s);
     prefs.putLong("p3s2_on", p3_s2_start_s); prefs.putLong("p3s2_off", p3_s2_end_s);
     prefs.putLong("p3s3_on", p3_s3_start_s); prefs.putLong("p3s3_off", p3_s3_end_s);
@@ -244,8 +282,9 @@ void handleSaveSchedule() {
 
     Serial.println("[SCHED] Đã lưu 18 mốc H:M:S vào Preferences.");
 
+    // 3. Gửi thông báo và chuyển hướng
     String html = "<html><head><meta charset='utf-8'><title>Đang lưu</title>";
-    html += "<meta http-equiv='refresh' content='2;url=/'></head>"; 
+    html += "<meta http-equiv='refresh' content='2;url=/'></head>"; // Tự chuyển hướng sau 2s
     html += "<body><p style='font-family:sans-serif;text-align:center;margin-top:30px;font-size:1.2em;'>";
     html += "✅ Đã lưu hẹn giờ H:M:S!<br>Đang quay về trang chủ...</p></body></html>";
     server.send(200, "text/html", html);
@@ -358,25 +397,24 @@ void handleSaveWifi() {
     ESP.restart();
 }
 
-// --- TRANG CHỦ (Đã sửa bỏ NTP/Sinric) ---
+// --- TRANG CHỦ (Giữ nguyên) ---
 String htmlPage() {
-    // [MỚI] Hiển thị thời gian chạy (Uptime)
-    unsigned long now_ms = millis();
-    unsigned long cycle_ms = now_ms % (24UL * 3600UL * 1000UL); // Thời gian trong chu kỳ 24h
-    
-    long h = cycle_ms / 3600000;
-    cycle_ms %= 3600000;
-    long m = cycle_ms / 60000;
-    cycle_ms %= 60000;
-    long s = cycle_ms / 1000;
-    
-    char timeStr[50];
-    sprintf(timeStr, "%02ld:%02ld:%02ld (Chu kỳ 24 giờ)", h, m, s);
+    String timeStr = "Đang chờ đồng bộ giờ...";
+    if (isInternetActive) {
+      struct tm timeinfo;
+      time_t now;
+      time(&now);
+      localtime_r(&now, &timeinfo);
+      if (timeinfo.tm_year > (2000 - 1900)) { // Kiểm tra giờ hợp lệ
+          char timeBuffer[50];
+          strftime(timeBuffer, 50, "%H:%M:%S | %d/%m/%Y", &timeinfo);
+          timeStr = String(timeBuffer);
+      }
+    }
 
     String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
     html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-    html += "<title>Remote Smart (Millis)</title>"; // Sửa tiêu đề
-    html += "<style>";
+    html += "<title>Remote Smart</title><style>";
     html += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;text-align:center;background:#f0f2f5;margin:0;padding:15px;}";
     html += "h3{color:#333;}";
     html += "a{text-decoration:none;}";
@@ -396,16 +434,29 @@ String htmlPage() {
     html += "</style></head><body>";
 
     html += "<div class='container'>";
-    html += "<h3>HỆ THỐNG ĐIỀU KHIỂN (OFFLINE)</h3>"; // Sửa tiêu đề
+    html += "<h3>HỆ THỐNG ĐIỀU KHIỂN</h3>";
 
     // --- Card Trạng thái ---
     html += "<div class='status'>";
     if (WiFi.status() == WL_CONNECTED) {
         html += "<strong>WIFI: </strong><span style='color:green;'>" + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")</span><br>";
+        if (!isInternetActive) {
+            html += "<strong>INTERNET: </strong><span style='color:orange;'>Đang kiểm tra (NTP)...</span><br>";
+        } else {
+             if (!sinricStarted) {
+                html += "<strong>INTERNET: </strong><span style='color:orange;'>Đang kết nối Sinric...</span><br>";
+             } else {
+                if (SinricPro.isConnected()) {
+                   html += "<strong>INTERNET: </strong><span style='color:green;'>Đã kết nối (Sinric/NTP)</span><br>";
+                } else {
+                   html += "<strong>INTERNET: </strong><span style='color:red;'>Mất kết nối Sinric!</span><br>";
+                }
+             }
+        }
     } else {
         html += "<strong>WIFI: </strong><span style='color:red;'>Chưa kết nối (AP: " + WiFi.softAPIP().toString() + ")</span><br>";
     }
-    html += "<strong>THỜI GIAN CHẠY: </strong>" + String(timeStr) + "<br>";
+    html += "<strong>GIỜ NTP: </strong>" + timeStr + "<br>";
     String status_text = stopAll ? "<span style='color:#f44336;'>ĐANG DỪNG</span>" : "<span style='color:#4CAF50;'>ĐANG CHẠY</span>";
     html += "<strong>TỰ ĐỘNG: </strong>" + status_text + "</div>";
 
@@ -424,20 +475,24 @@ String htmlPage() {
     addBtnCard("Ổ cắm 1 (tên máy)", state1, "/toggle1");
     addBtnCard("Ổ cắm 2 (tên máy)", state2, "/toggle2");
     addBtnCard("Ổ cắm 3 (tên máy)", state3, "/toggle3");
-    addBtnCard("Ổ cắm 4 (tên máy)", state4, "/toggle4"); 
+    addBtnCard("Ổ cắm 4 (tên máy)", state4, "/toggle4"); // Vẫn hiển thị
 
     addBtnCard(stopAll ? "Bật tự động" : "Dừng tự động", stopAll, "/toggleStop", "control");
     addBtnCard("Khởi động lại", false, "/resetAuto", "control");
-    addBtnCard("Cài đặt Hẹn giờ", false, "/hengio", "ota"); 
-    addBtnCard("Cài đặt WiFi", false, "/wifi", "wifi"); 
-
-    html += "</div>"; 
     
+    // === [MỚI] THÊM NÚT HẸN GIỜ ===
+    addBtnCard("Cài đặt Hẹn giờ", false, "/hengio", "ota"); // Dùng màu cam
+    
+    addBtnCard("Cài đặt WiFi", false, "/wifi", "wifi"); // Dùng màu xám
+
+    html += "</div>"; // Đóng .grid
+    
+    // Thêm nút OTA (tách riêng vì nó không vừa vào lưới 8)
     html += "<div class='grid' style='grid-template-columns:1fr;'>";
     addBtnCard("Cập nhật FW", false, "/otaUpdate", "ota");
     html += "</div>";
     
-    html += "</div>"; 
+    html += "</div>"; // Đóng .container
     html += "</body></html>";
     return html;
 }
@@ -485,20 +540,70 @@ void performOTA() {
     https.end();
 }
 
+// ====================== Sinric Handler ======================
+// (Giữ nguyên)
+bool onPowerState1(const String &deviceId, bool &state) {
+    if (!stopAll) {
+        Serial.println("⚠️ Lệnh Sinric Pro bị bỏ qua do Auto Control đang chạy!");
+        state = state1;
+        return false;
+    }
+    digitalWrite(PIN_1, state);
+    state1 = state;
+    Serial.printf("[SINRIC] Chân 4: %s\n", state ? "ON" : "OFF");
+    return true;
+}
 
-// === [MỚI] HÀM AUTOCONTROL (v8 - Dùng Millis 24h) ===
+bool onPowerState2(const String &deviceId, bool &state) {
+    if (!stopAll) {
+        Serial.println("⚠️ Lệnh Sinric Pro bị bỏ qua do Auto Control đang chạy!");
+        state = state2;
+        return false;
+    }
+    digitalWrite(PIN_2, state);
+    state2 = state;
+    Serial.printf("[SINRIC] Chân 5: %s\n", state ? "ON" : "OFF");
+    return true;
+}
+
+bool onPowerState3(const String &deviceId, bool &state) {
+    if (!stopAll) {
+        Serial.println("⚠️ Lệnh Sinric Pro bị bỏ qua do Auto Control đang chạy!");
+        state = state3;
+        return false;
+    }
+    digitalWrite(PIN_3, state);
+    state3 = state;
+    Serial.printf("[SINRIC] Chân 7: %s\n", state ? "ON" : "OFF");
+    return true;
+}
+
+
+// === [MỚI] HÀM AUTOCONTROL (v7 - 3 Chân, 3 Lịch, H:M:S) ===
 void autoControl() {
     if (stopAll) return;
 
-    const unsigned long CYCLE_SECONDS = 24UL * 3600UL; // 86400 giây
-    unsigned long currentTimeInSeconds = (millis() / 1000) % CYCLE_SECONDS;
+    time_t now;
+    time(&now);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
 
+    if (timeinfo.tm_year < (2024 - 1900)) {
+        return; // Giờ NTP chưa sẵn sàng
+    }
+
+    // Tính TỔNG SỐ GIÂY hiện tại trong ngày
+    long currentTimeInSeconds = (timeinfo.tm_hour * 3600) + (timeinfo.tm_min * 60) + timeinfo.tm_sec;
+
+    // --- Logic chung cho lịch hẹn giờ (theo TỔNG SỐ GIÂY) ---
     auto getTargetState = [&](long startSec, long endSec) {
-        if (startSec == endSec) return false; 
+        if (startSec == endSec) return false; // Nếu giờ Bật = giờ Tắt -> Luôn TẮT
         
         if (startSec < endSec) {
+            // Lịch trong ngày (ví dụ: 10:00:00 - 12:00:00)
             return (currentTimeInSeconds >= startSec) && (currentTimeInSeconds < endSec);
         } else {
+            // Lịch qua đêm (ví dụ: 22:00:00 - 05:00:00)
             return (currentTimeInSeconds >= startSec) || (currentTimeInSeconds < endSec);
         }
     };
@@ -511,6 +616,7 @@ void autoControl() {
     if (targetState1 != state1) {
         state1 = targetState1;
         digitalWrite(PIN_1, state1);
+        if (sinricStarted) ((SinricProSwitch&)SinricPro[SWITCH_ID_1]).sendPowerStateEvent(state1);
         Serial.printf("[AUTO] Chân 4: %s\n", state1 ? "BẬT" : "TẮT");
     }
 
@@ -522,6 +628,7 @@ void autoControl() {
     if (targetState2 != state2) {
         state2 = targetState2;
         digitalWrite(PIN_2, state2);
+        if (sinricStarted) ((SinricProSwitch&)SinricPro[SWITCH_ID_2]).sendPowerStateEvent(state2);
         Serial.printf("[AUTO] Chân 5: %s\n", state2 ? "BẬT" : "TẮT");
     }
 
@@ -533,26 +640,67 @@ void autoControl() {
     if (targetState3 != state3) {
         state3 = targetState3;
         digitalWrite(PIN_3, state3);
+        if (sinricStarted) ((SinricProSwitch&)SinricPro[SWITCH_ID_3]).sendPowerStateEvent(state3);
         Serial.printf("[AUTO] Chân 7: %s\n", state3 ? "BẬT" : "TẮT");
     }
+
+    // --- Chân 16 (PIN_4) KHÔNG CÓ LỊCH AUTO ---
+    // (nó sẽ giữ nguyên trạng thái do người dùng bật/tắt tay)
 }
 
 
-// === TÁC VỤ LÕI 0 (ĐÃ SỬA, CHỈ CHẠY LOGIC) ===
-void logicTask(void *pvParameters) {
-    Serial.println("[TASK] Tác vụ Logic (Millis) đã khởi động trên Lõi 0.");
+// === TÁC VỤ LÕI 0 (Giữ nguyên logic v5) ===
+void networkTask(void *pvParameters) {
+    Serial.println("[TASK] Tác vụ Mạng đã khởi động trên Lõi 0.");
+    initTime(); 
 
+    unsigned long lastNtpCheck = 0;
     unsigned long lastAutoControl = 0;
 
     for (;;) { 
+        if (WiFi.status() != WL_CONNECTED) {
+            if (sinricStarted) {
+                Serial.println("[TASK] Mất WiFi. Tạm dừng Sinric/NTP.");
+                sinricStarted = false; 
+                isInternetActive = false;
+            }
+            vTaskDelay(1000 / portTICK_PERIOD_MS); 
+            continue; 
+        }
+
+        if (!isInternetActive || (millis() - lastNtpCheck > 10000)) { 
+            Serial.println("[TASK] Có WiFi, đang kiểm tra Internet (NTP)...");
+            struct tm timeinfo;
+            if (getLocalTime(&timeinfo, 2000)) { 
+                if (!isInternetActive) {
+                    Serial.printf("[TASK] ✅ Đã đồng bộ giờ NTP: %02d:%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+                    isInternetActive = true; 
+                }
+            } else {
+                Serial.println("[TASK] ❌ NTP thất bại (chưa có Internet).");
+                isInternetActive = false;
+            }
+            lastNtpCheck = millis(); 
+        }
+
+        if (isInternetActive && !sinricStarted) {
+            Serial.println("[TASK] Có thời gian, đang thử SinricPro.begin()...");
+            SinricPro.begin(APP_KEY, APP_SECRET);
+            Serial.println("[TASK] SinricPro.begin() đã chạy xong.");
+            sinricStarted = true;
+        }
+
+        if (sinricStarted) {
+            SinricPro.handle();
+        }
+
         // Chạy autoControl 1 giây 1 lần
-        if (millis() - lastAutoControl >= 1000) {
-            autoControl(); // Gọi hàm autoControl (v8) mới
+        if (isInternetActive && (millis() - lastAutoControl > 1000)) {
+            autoControl(); // Gọi hàm autoControl (v7) mới
             lastAutoControl = millis();
         }
         
-        // Nghỉ 100ms
-        vTaskDelay(100 / portTICK_PERIOD_MS);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 }
 // ===================================
@@ -579,6 +727,7 @@ void setup() {
     pinMode(PIN_OTA, INPUT_PULLUP);
 
     state1 = state2 = state3 = state4 = LOW;
+    startTime = millis();
 
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(ap_ssid, ap_pass);
@@ -609,13 +758,16 @@ void setup() {
     // Khai báo Web Server Handlers (CHẠY TRÊN LÕI 1)
     server.on("/", [](){ server.send(200, "text/html", htmlPage()); });
 
+    // === [MỚI] THÊM HANDLER CHO TRANG HẸN GIỜ (v7) ===
     server.on("/hengio", HTTP_GET, handleSchedulePage);
     server.on("/save_hengio", HTTP_POST, handleSaveSchedule);
+    // ================================================
 
     // Toggle 1
     server.on("/toggle1", [](){
-        if (stopAll) { 
+        if (stopAll) { // Chỉ cho phép điều khiển tay khi Auto DỪNG
             state1 = !state1; digitalWrite(PIN_1, state1);
+            if(sinricStarted) ((SinricProSwitch&)SinricPro[SWITCH_ID_1]).sendPowerStateEvent(state1);
         }
         server.sendHeader("Location", "/"); server.send(303);
     });
@@ -623,6 +775,7 @@ void setup() {
     server.on("/toggle2", [](){
         if (stopAll) {
             state2 = !state2; digitalWrite(PIN_2, state2);
+            if(sinricStarted) ((SinricProSwitch&)SinricPro[SWITCH_ID_2]).sendPowerStateEvent(state2);
         }
         server.sendHeader("Location", "/"); server.send(303);
     });
@@ -630,11 +783,12 @@ void setup() {
     server.on("/toggle3", [](){
         if (stopAll) {
             state3 = !state3; digitalWrite(PIN_3, state3);
+            if(sinricStarted) ((SinricProSwitch&)SinricPro[SWITCH_ID_3]).sendPowerStateEvent(state3);
         }
         server.sendHeader("Location", "/"); server.send(303);
     });
     
-    // Toggle 4 (Chân 16)
+    // Toggle 4 (Chân 16) - Luôn điều khiển tay được (nếu stopAll)
     server.on("/toggle4", [](){
         if (stopAll) {
             state4 = !state4;
@@ -652,18 +806,12 @@ void setup() {
         saveState();
         server.sendHeader("Location", "/"); server.send(303);
     });
-    
-    // === [SỬA v8.1] NÚT RESET WEB ===
-    // Nút Khởi động lại (Reset) từ Web -> Sẽ BẬT AUTO và khởi động lại ESP
     server.on("/resetAuto", [](){
-        Serial.println("[WEB] Nhan nut KHOI DONG LAI! Bat Auto va restart...");
-        stopAll = false; // Đảm bảo Auto được BẬT
-        saveState();     // Lưu trạng thái BẬT
-        server.send(200, "text/html", "<p style='font-family:sans-serif;font-size:1.2em;text-align:center;'>Da bat Auto.<br>Dang khoi dong lai...</p>");
-        delay(1000);
-        ESP.restart(); // Khởi động lại chip
+        startTime = millis();
+        stopAll = false;
+        saveState();
+        server.sendHeader("Location", "/"); server.send(303);
     });
-    
     server.on("/otaUpdate", [](){ server.send(200, "text/html", "<h3>Đang cập nhật firmware...</h3>"); performOTA(); });
 
     // Các handler WiFi
@@ -684,51 +832,63 @@ void setup() {
 
     server.begin();
 
-    Serial.println("✅ ESP32-S3 (v8.1 - Millis) đã khởi động hoàn tất! Web Server đang chạy trên Lõi 1.");
+    // SinricPro setup
+    SinricProSwitch &device1 = SinricPro[SWITCH_ID_1];
+    SinricProSwitch &device2 = SinricPro[SWITCH_ID_2];
+    SinricProSwitch &device3 = SinricPro[SWITCH_ID_3];
+    device1.onPowerState(onPowerState1);
+    device2.onPowerState(onPowerState2);
+    device3.onPowerState(onPowerState3);
+
+    Serial.println("✅ ESP32-S3 (v7) đã khởi động hoàn tất! Web Server đang chạy trên Lõi 1.");
 
     // === KHỞI ĐỘNG TÁC VỤ LÕI 0 ===
     xTaskCreatePinnedToCore(
-        logicTask,          /* Hàm để chạy Task */
-        "LogicTask",        /* Tên của Task (để debug) */
-        4096,               /* Kích thước Stack (giảm) */
+        networkTask,        /* Hàm để chạy Task */
+        "NetworkTask",      /* Tên của Task (để debug) */
+        12000,              /* Kích thước Stack */
         NULL,               /* Tham số đầu vào cho Task */
         1,                  /* Ưu tiên (priority) */
-        &LogicTaskHandle,   /* Handle của Task */
+        &NetworkTaskHandle, /* Handle của Task */
         0                   /* Ghim vào Lõi 0 (Core 0) */
     );
 }
 
 // ====================== LOOP (LÕI 1 - SIÊU NHANH) ======================
-// === [SỬA v8.1] LOGIC NÚT NHẤN ===
 void loop() {
     dns.processNextRequest();
     server.handleClient();
 
     unsigned long now = millis();
-    
+    bool stateChanged = false;
+
     // Nút DỪNG Auto (PIN_STOP - GPIO 8)
     if (digitalRead(PIN_STOP) == LOW) {
         if (now - lastStopButtonTime > DEBOUNCE_DELAY) {
-            if (!stopAll) { // Chỉ kích hoạt 1 lần
+            if (!stopAll) {
                 stopAll = true;
-                saveState(); // Lưu trạng thái DỪNG ngay lập tức
+                stateChanged = true;
                 Serial.println("[BUTTON] Auto Control DỪNG (PIN_STOP)");
             }
         }
         lastStopButtonTime = now;
     }
 
-    // Nút KHỞI ĐỘNG LẠI ESP (PIN_RESET - GPIO 9)
-    // Sẽ BẬT AUTO và khởi động lại chip
+    // Nút KHỞI ĐỘNG/BẬT Auto (PIN_RESET - GPIO 9)
     if (digitalRead(PIN_RESET) == LOW) {
         if (now - lastResetButtonTime > DEBOUNCE_DELAY) {
-            Serial.println("[BUTTON] Nhan nut KHOI DONG LAI! Bat Auto va restart...");
-            stopAll = false; // Đảm bảo Auto được BẬT
-            saveState();     // Lưu trạng thái BẬT
-            delay(500);      // Chờ Serial in ra
-            ESP.restart();   // Khởi động lại chip
+            if (stopAll) {
+                startTime = now;
+                stopAll = false;
+                stateChanged = true;
+                Serial.println("[BUTTON] Auto Control BẬT (PIN_RESET)");
+            }
         }
         lastResetButtonTime = now;
+    }
+
+    if (stateChanged) {
+        saveState();
     }
 
     // Nút OTA
